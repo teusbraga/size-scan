@@ -1,0 +1,11 @@
+# Compilação e Binários Intermediários
+*.obj
+*.pdb
+*.ilk
+*.suo
+*.user
+*.log
+.vs/
+
+# Logs locais
+sizescan_crash.log
