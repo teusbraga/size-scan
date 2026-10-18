@@ -103,6 +103,7 @@ private:
 
     // Timer de Varredura
     UINT_PTR m_timer_id;
+    bool m_was_scanning;
 
     // Persistent GDI+ Backbuffer (elimina 46 MB/s de alocações)
     Gdiplus::Bitmap *m_pBackBuffer;

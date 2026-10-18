@@ -99,18 +99,28 @@ static uint64_t ScanDirectoryInternal(
     if (now - last_progress_tick > 80) {
         last_progress_tick = now;
         if (is_partition_root && res.disk_used_bytes > 0) {
-            double p = ((double)res.total_scanned_bytes / (double)res.disk_used_bytes) * 100.0;
-            if (p > 99.0) p = 99.0;
+            double p = ((double)res.total_scanned_bytes / (double)res.disk_used_bytes) * 98.0;
+            if (p > 98.0) p = 98.0;
             if (p < 0.0) p = 0.0;
             res.scan_progress_pct = (float)p;
         } else if (top_dir_count > 0) {
-            float base = ((float)current_top_index / (float)top_dir_count) * 100.0f;
-            if (base > 98.0f) base = 98.0f;
-            if (base < 0.0f) base = 0.0f;
-            res.scan_progress_pct = base;
+            float folder_base = ((float)current_top_index / (float)top_dir_count) * 98.0f;
+            float folder_slice = (1.0f / (float)top_dir_count) * 98.0f;
+            float intra = 0.1f + 0.8f * (1.0f - expf(-(float)(res.total_files % 8000) / 2000.0f));
+            float p = folder_base + folder_slice * intra;
+            if (p > 98.0f) p = 98.0f;
+            if (p < 0.0f) p = 0.0f;
+            res.scan_progress_pct = p;
         }
         if (progress_fn) {
-            progress_fn(current_dir, user_data);
+            ScanProgressInfo info;
+            info.current_folder = current_dir;
+            info.progress_pct = res.scan_progress_pct;
+            info.total_files = res.total_files;
+            info.total_folders = res.total_folders;
+            info.total_scanned_bytes = res.total_scanned_bytes;
+            info.total_scanned_on_disk = res.total_scanned_on_disk;
+            progress_fn(info, user_data);
         }
     }
 
@@ -171,9 +181,6 @@ static uint64_t ScanDirectoryInternal(
 
         if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             folder_sub_count++;
-            if (depth == 0) {
-                current_top_index++;
-            }
             uint32_t sub_files = 0, sub_dirs = 0;
             uint64_t sub_size = ScanDirectoryInternal(
                 res, item_path, item_len, &sub_files, &sub_dirs,
@@ -183,6 +190,9 @@ static uint64_t ScanDirectoryInternal(
             folder_total_size += sub_size;
             folder_file_count += sub_files;
             folder_sub_count += sub_dirs;
+            if (depth == 0) {
+                current_top_index++;
+            }
         } else {
             // File
             ULARGE_INTEGER fsz;
@@ -291,10 +301,18 @@ bool FastScanner::Run(
     // [MODO TURBO]: Se for a raiz de uma particao e tivermos acesso direto ao volume (Admin),
     // aciona o leitor direto da MFT acelerado por Assembly x64!
     if (is_partition_root && MftReader::CanAccessVolume(out_result.root_path)) {
-        if (progress_fn) progress_fn(L"⚡ Acionando Motor MFT TURBO (x64 Assembly)...", user_data);
+        if (progress_fn) {
+            ScanProgressInfo info;
+            info.current_folder = L"⚡ Acionando Motor MFT TURBO (x64 Assembly)...";
+            info.progress_pct = 5.0f;
+            info.total_files = 0;
+            info.total_folders = 0;
+            info.total_scanned_bytes = 0;
+            info.total_scanned_on_disk = 0;
+            progress_fn(info, user_data);
+        }
         if (MftReader::ScanVolumeMFT(out_result.root_path, out_result, cancel_flag, is_running, progress_fn, user_data)) {
             out_result.scan_progress_pct = 100.0f;
-            if (is_running) *is_running = false;
             return true;
         }
     }
@@ -341,21 +359,44 @@ bool FastScanner::Run(
         current_top_index
     );
 
-    out_result.scan_progress_pct = 100.0f;
+    // Fase final: Organizar e classificar resultados
+    out_result.scan_progress_pct = 99.0f;
 
-    if (is_running) *is_running = false;
+    if (progress_fn) {
+        ScanProgressInfo info;
+        info.current_folder = L"📊 Organizando e classificando resultados...";
+        info.progress_pct = 99.0f;
+        info.total_files = out_result.total_files;
+        info.total_folders = out_result.total_folders;
+        info.total_scanned_bytes = out_result.total_scanned_bytes;
+        info.total_scanned_on_disk = out_result.total_scanned_on_disk;
+        progress_fn(info, user_data);
+    }
 
-    // Ordenação no vetor plano
+    // Ordenação multi-core paralela de altíssima performance
     if (out_result.files.size() > 1) {
-        std::sort(out_result.files.begin(), out_result.files.end(), [](const FastFileRecord &a, const FastFileRecord &b) {
+        std::sort(std::execution::par, out_result.files.begin(), out_result.files.end(), [](const FastFileRecord &a, const FastFileRecord &b) {
             return a.size_bytes > b.size_bytes;
         });
     }
 
     if (out_result.folders.size() > 1) {
-        std::sort(out_result.folders.begin(), out_result.folders.end(), [](const FastFolderRecord &a, const FastFolderRecord &b) {
+        std::sort(std::execution::par, out_result.folders.begin(), out_result.folders.end(), [](const FastFolderRecord &a, const FastFolderRecord &b) {
             return a.cumulative_size > b.cumulative_size;
         });
+    }
+
+    out_result.scan_progress_pct = 100.0f;
+
+    if (progress_fn) {
+        ScanProgressInfo info;
+        info.current_folder = L"Concluído";
+        info.progress_pct = 100.0f;
+        info.total_files = out_result.total_files;
+        info.total_folders = out_result.total_folders;
+        info.total_scanned_bytes = out_result.total_scanned_bytes;
+        info.total_scanned_on_disk = out_result.total_scanned_on_disk;
+        progress_fn(info, user_data);
     }
 
     if (cancel_flag && *cancel_flag) {

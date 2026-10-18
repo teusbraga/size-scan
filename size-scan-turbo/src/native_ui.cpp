@@ -45,6 +45,7 @@ NativeUI::NativeUI()
     , m_max_scroll_y(0)
     , m_hovered_region_id(-1)
     , m_timer_id(0)
+    , m_was_scanning(false)
     , m_pBackBuffer(nullptr)
     , m_backBufferWidth(0)
     , m_backBufferHeight(0)
@@ -1385,8 +1386,12 @@ LRESULT NativeUI::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_TIMER:
-            if (wParam == 1 && g_model.IsScanning()) {
-                InvalidateRect(hwnd, NULL, FALSE);
+            if (wParam == 1) {
+                bool scanning = g_model.IsScanning();
+                if (scanning || m_was_scanning) {
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+                m_was_scanning = scanning;
             }
             return 0;
 

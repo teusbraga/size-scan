@@ -6,10 +6,21 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <execution>
 #include "../../types.h"
 
+// Informações detalhadas de progresso em tempo real entre threads
+struct ScanProgressInfo {
+    const wchar_t *current_folder;
+    float progress_pct;
+    uint64_t total_files;
+    uint64_t total_folders;
+    uint64_t total_scanned_bytes;
+    uint64_t total_scanned_on_disk;
+};
+
 // Callback para progresso de varredura seguro entre threads
-typedef void (*ScanProgressFn)(const wchar_t *current_folder, void *user_data);
+typedef void (*ScanProgressFn)(const ScanProgressInfo &info, void *user_data);
 
 // StringPool de altíssima performance (alocação em blocos contíguos de 2 MB)
 class StringPool {
@@ -89,6 +100,41 @@ public:
     const wchar_t* AddString(const wchar_t *str) {
         if (!str) return L"";
         return AddString(str, wcslen(str));
+    }
+
+    const wchar_t* AddPath(const wchar_t *parent, size_t parentLen, const wchar_t *name, size_t nameLen) {
+        if (!parent || parentLen == 0) return AddString(name, nameLen);
+        if (!name || nameLen == 0) return AddString(parent, parentLen);
+
+        bool needsSlash = (parent[parentLen - 1] != L'\\' && parent[parentLen - 1] != L'/');
+        size_t extra = needsSlash ? 1 : 0;
+        size_t needed = parentLen + extra + nameLen + 1;
+
+        if (!m_current || (m_current->used + needed > m_current->capacity)) {
+            size_t cap = (needed > m_chunkSize) ? needed : m_chunkSize;
+            size_t totalBytes = sizeof(Chunk) + (cap - 1) * sizeof(wchar_t);
+            Chunk *c = (Chunk*)malloc(totalBytes);
+            if (!c) return L"";
+            c->next = nullptr;
+            c->capacity = cap;
+            c->used = 0;
+            if (!m_head) {
+                m_head = c;
+            } else {
+                m_current->next = c;
+            }
+            m_current = c;
+        }
+
+        wchar_t *dest = m_current->data + m_current->used;
+        memcpy(dest, parent, parentLen * sizeof(wchar_t));
+        if (needsSlash) {
+            dest[parentLen] = L'\\';
+        }
+        memcpy(dest + parentLen + extra, name, nameLen * sizeof(wchar_t));
+        dest[parentLen + extra + nameLen] = L'\0';
+        m_current->used += needed;
+        return dest;
     }
 
 private:

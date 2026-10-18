@@ -5,6 +5,8 @@
 #include <vector>
 #include <unordered_map>
 #include <chrono>
+#include <algorithm>
+#include <execution>
 
 #pragma pack(push, 1)
 
@@ -179,6 +181,7 @@ struct TempItem {
     uint64_t realSize;
     uint64_t allocSize;
     bool isDirectory;
+    bool inUse;
 };
 
 bool MftReader::ScanVolumeMFT(
@@ -279,16 +282,27 @@ bool MftReader::ScanVolumeMFT(
         mftExtents.push_back(ext);
     }
 
-    // Tabela temporaria de indexacao de registros por FRN (File Reference Number)
-    std::unordered_map<uint64_t, TempItem> frnMap;
-    frnMap.reserve(600000);
-
     // Buffer de streaming alinhado de 2 MB para leitura ultra-rapida sequencial do disco
     const size_t CHUNK_SIZE = 2 * 1024 * 1024;
     std::vector<BYTE> chunkBuffer(CHUNK_SIZE);
     uint64_t currentFRN = 0;
 
     auto startTime = std::chrono::high_resolution_clock::now();
+
+    int64_t totalMftBytes = 0;
+    for (const auto &ext : mftExtents) {
+        totalMftBytes += ext.clusterCount * clusterSize;
+    }
+
+    size_t estRecords = (bytesPerRecord > 0) ? (size_t)(totalMftBytes / bytesPerRecord) + 4096 : 1000000;
+    std::vector<TempItem> records(estRecords);
+    for (auto &r : records) {
+        r.inUse = false;
+    }
+    size_t validRecordCount = 0;
+
+    int64_t totalBytesReadAcrossExtents = 0;
+    DWORD lastProgressTick = GetTickCount();
 
     for (const auto &ext : mftExtents) {
         if (cancel_flag && *cancel_flag) break;
@@ -308,9 +322,30 @@ bool MftReader::ScanVolumeMFT(
                 break;
             }
             bytesRemaining -= bytesRead;
+            totalBytesReadAcrossExtents += bytesRead;
+
+            DWORD now = GetTickCount();
+            if (now - lastProgressTick > 80) {
+                lastProgressTick = now;
+                float pct = (totalMftBytes > 0) ? ((float)totalBytesReadAcrossExtents / (float)totalMftBytes) * 45.0f : 20.0f;
+                if (pct > 45.0f) pct = 45.0f;
+                if (progress_fn) {
+                    ScanProgressInfo info;
+                    info.current_folder = L"⚡ Lendo tabela MFT do volume (Assembly x64)...";
+                    info.progress_pct = pct;
+                    info.total_files = validRecordCount;
+                    info.total_folders = 0;
+                    info.total_scanned_bytes = 0;
+                    info.total_scanned_on_disk = 0;
+                    progress_fn(info, user_data);
+                }
+            }
 
             size_t numRecords = bytesRead / bytesPerRecord;
             for (size_t r = 0; r < numRecords; r++, currentFRN++) {
+                if (currentFRN >= records.size()) {
+                    records.resize(currentFRN + 65536);
+                }
                 BYTE *pRec = chunkBuffer.data() + (r * bytesPerRecord);
 
                 // Rotina em Assembly x64: valida assinatura 'FILE' e aplica os fixups de setor
@@ -384,7 +419,9 @@ bool MftReader::ScanVolumeMFT(
                     item.realSize = realSize;
                     item.allocSize = allocSize;
                     item.isDirectory = isDir;
-                    frnMap[currentFRN] = item;
+                    item.inUse = true;
+                    records[currentFRN] = item;
+                    validRecordCount++;
                 }
             }
         }
@@ -392,44 +429,47 @@ bool MftReader::ScanVolumeMFT(
 
     CloseHandle(hVol);
 
-    if (frnMap.empty()) {
+    if (validRecordCount == 0) {
         return false;
     }
 
-    // Resolucao da arvore completa em O(N) com caminhos completos
+    // Resolucao da arvore de pastas em O(N) com caminhos completos
     std::unordered_map<uint64_t, std::wstring> pathCache;
-    pathCache.reserve(frnMap.size() / 5);
+    pathCache.reserve(validRecordCount / 8);
     pathCache[5] = rootPath; // Registro 5 na MFT sempre e a raiz do disco (ex: C:\)
 
     auto buildPath = [&](uint64_t frn, auto &self) -> std::wstring {
+        if (frn >= records.size()) return rootPath;
         auto it = pathCache.find(frn);
         if (it != pathCache.end()) return it->second;
 
-        auto itemIt = frnMap.find(frn);
-        if (itemIt == frnMap.end() || frn == itemIt->second.parentFRN) {
+        const auto &item = records[frn];
+        if (!item.inUse || item.name == nullptr || frn == item.parentFRN) {
             return rootPath;
         }
 
-        std::wstring parentPath = self(itemIt->second.parentFRN, self);
+        std::wstring parentPath = self(item.parentFRN, self);
         std::wstring full;
         if (!parentPath.empty() && parentPath.back() == L'\\') {
-            full = parentPath + itemIt->second.name;
+            full = parentPath + item.name;
         } else {
-            full = parentPath + L"\\" + itemIt->second.name;
+            full = parentPath + L"\\" + item.name;
         }
         pathCache[frn] = full;
         return full;
     };
 
     // Montar registros finais de arquivos e pastas no FastScanResult
-    out_result.files.reserve(frnMap.size());
-    out_result.folders.reserve(frnMap.size() / 10);
+    out_result.files.reserve(validRecordCount);
+    out_result.folders.reserve(validRecordCount / 8);
 
-    std::unordered_map<uint64_t, size_t> folderIndexByFrn;
+    std::vector<uint32_t> folderIndexByFrn(records.size(), 0xFFFFFFFF);
 
-    // Primeiro passar as pastas para a lista
-    for (auto const& [frn, item] : frnMap) {
-        if (item.isDirectory) {
+    // 1. Primeiro passar as pastas para a lista
+    for (size_t frn = 0; frn < records.size(); frn++) {
+        if (cancel_flag && *cancel_flag) break;
+        const auto &item = records[frn];
+        if (item.inUse && item.isDirectory) {
             std::wstring folderPath = buildPath(frn, buildPath);
             FastFolderRecord fRec;
             fRec.folder_path = out_result.pool.AddString(folderPath.c_str());
@@ -439,21 +479,35 @@ bool MftReader::ScanVolumeMFT(
             fRec.subfolder_count = 0;
             fRec.is_redundant_child = false;
 
-            folderIndexByFrn[frn] = out_result.folders.size();
+            folderIndexByFrn[frn] = (uint32_t)out_result.folders.size();
             out_result.folders.push_back(fRec);
         }
     }
 
-    // Em seguida processar os arquivos e acumular estatisticas
-    for (auto const& [frn, item] : frnMap) {
-        if (!item.isDirectory) {
-            std::wstring parentPath = buildPath(item.parentFRN, buildPath);
-            std::wstring fullPath = parentPath;
-            if (!fullPath.empty() && fullPath.back() != L'\\') fullPath += L'\\';
-            fullPath += item.name;
+    if (progress_fn) {
+        ScanProgressInfo info;
+        info.current_folder = L"⚡ Reconstruindo hierarquia de diretórios...";
+        info.progress_pct = 50.0f;
+        info.total_files = 0;
+        info.total_folders = out_result.folders.size();
+        info.total_scanned_bytes = 0;
+        info.total_scanned_on_disk = 0;
+        progress_fn(info, user_data);
+    }
+
+    // 2. Em seguida processar os arquivos com concatenação direta e zero alocações na heap
+    for (size_t frn = 0; frn < records.size(); frn++) {
+        if (cancel_flag && *cancel_flag) break;
+        const auto &item = records[frn];
+        if (item.inUse && !item.isDirectory) {
+            uint32_t parentFolderIdx = (item.parentFRN < folderIndexByFrn.size()) ? folderIndexByFrn[item.parentFRN] : 0xFFFFFFFF;
+            const wchar_t *parentPath = (parentFolderIdx != 0xFFFFFFFF) ? out_result.folders[parentFolderIdx].folder_path : rootPath;
+
+            size_t parentLen = wcslen(parentPath);
+            size_t nameLen = wcslen(item.name);
 
             FastFileRecord fileRec;
-            fileRec.full_path = out_result.pool.AddString(fullPath.c_str());
+            fileRec.full_path = out_result.pool.AddPath(parentPath, parentLen, item.name, nameLen);
             fileRec.file_name = item.name;
             fileRec.size_bytes = item.realSize;
             fileRec.size_on_disk = item.allocSize;
@@ -473,33 +527,73 @@ bool MftReader::ScanVolumeMFT(
             out_result.files.push_back(fileRec);
 
             // Acumular no pai direto se estiver registrado
-            auto fIt = folderIndexByFrn.find(item.parentFRN);
-            if (fIt != folderIndexByFrn.end()) {
-                out_result.folders[fIt->second].cumulative_size += fileRec.size_bytes;
-                out_result.folders[fIt->second].file_count++;
+            if (parentFolderIdx != 0xFFFFFFFF) {
+                out_result.folders[parentFolderIdx].cumulative_size += fileRec.size_bytes;
+                out_result.folders[parentFolderIdx].file_count++;
+            }
+
+            DWORD now = GetTickCount();
+            if (now - lastProgressTick > 80) {
+                lastProgressTick = now;
+                float pct = 50.0f + ((float)out_result.total_files / (float)validRecordCount) * 48.0f;
+                if (pct > 98.0f) pct = 98.0f;
+                if (progress_fn) {
+                    ScanProgressInfo info;
+                    info.current_folder = fileRec.full_path;
+                    info.progress_pct = pct;
+                    info.total_files = out_result.total_files;
+                    info.total_folders = out_result.folders.size();
+                    info.total_scanned_bytes = out_result.total_scanned_bytes;
+                    info.total_scanned_on_disk = out_result.total_scanned_on_disk;
+                    progress_fn(info, user_data);
+                }
             }
         }
     }
 
     out_result.total_folders = out_result.folders.size();
 
-    // Ordenar os arquivos mais pesados
-    std::sort(out_result.files.begin(), out_result.files.end(), [](const FastFileRecord &a, const FastFileRecord &b) {
-        return a.size_bytes > b.size_bytes;
-    });
+    // Notificar UI de que estamos organizando e classificando os resultados
+    if (progress_fn) {
+        ScanProgressInfo info;
+        info.current_folder = L"📊 Organizando e classificando resultados...";
+        info.progress_pct = 99.0f;
+        info.total_files = out_result.total_files;
+        info.total_folders = out_result.total_folders;
+        info.total_scanned_bytes = out_result.total_scanned_bytes;
+        info.total_scanned_on_disk = out_result.total_scanned_on_disk;
+        progress_fn(info, user_data);
+    }
 
-    // Ordenar as pastas mais pesadas
-    std::sort(out_result.folders.begin(), out_result.folders.end(), [](const FastFolderRecord &a, const FastFolderRecord &b) {
-        return a.cumulative_size > b.cumulative_size;
-    });
+    // Ordenação multi-core paralela com std::execution::par
+    if (out_result.files.size() > 1) {
+        std::sort(std::execution::par, out_result.files.begin(), out_result.files.end(), [](const FastFileRecord &a, const FastFileRecord &b) {
+            return a.size_bytes > b.size_bytes;
+        });
+    }
+
+    if (out_result.folders.size() > 1) {
+        std::sort(std::execution::par, out_result.folders.begin(), out_result.folders.end(), [](const FastFolderRecord &a, const FastFolderRecord &b) {
+            return a.cumulative_size > b.cumulative_size;
+        });
+    }
 
     auto endTime = std::chrono::high_resolution_clock::now();
     double elapsedSec = std::chrono::duration<double>(endTime - startTime).count();
 
+    out_result.scan_progress_pct = 100.0f;
+
     if (progress_fn) {
         wchar_t msg[128];
         swprintf_s(msg, 128, L"🚀 MFT TURBO: %llu arquivos em %.2fs", out_result.total_files, elapsedSec);
-        progress_fn(msg, user_data);
+        ScanProgressInfo info;
+        info.current_folder = msg;
+        info.progress_pct = 100.0f;
+        info.total_files = out_result.total_files;
+        info.total_folders = out_result.total_folders;
+        info.total_scanned_bytes = out_result.total_scanned_bytes;
+        info.total_scanned_on_disk = out_result.total_scanned_on_disk;
+        progress_fn(info, user_data);
     }
 
     return true;

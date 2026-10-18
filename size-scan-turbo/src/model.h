@@ -65,6 +65,7 @@ public:
     const wchar_t* GetCurrentPath() const { return m_target_path; }
     std::wstring GetCurrentScannedFolderSafe() const;
     void SetCurrentScannedFolder(const wchar_t *folder);
+    void UpdateScanProgress(const ScanProgressInfo &info);
 
     uint64_t GetDiskTotal() const;
     uint64_t GetDiskFree() const;
@@ -101,6 +102,18 @@ private:
     HANDLE m_hWorkerThread;
     mutable std::mutex m_data_mutex;
     mutable std::mutex m_folder_mutex;
+
+    // Valores de progresso ao vivo (thread-safe, atualizados durante o escaneamento)
+    std::atomic<float> m_live_progress_pct{0.0f};
+    std::atomic<uint64_t> m_live_files{0};
+    std::atomic<uint64_t> m_live_folders{0};
+    std::atomic<uint64_t> m_live_scanned_bytes{0};
+    std::atomic<uint64_t> m_live_scanned_on_disk{0};
+
+    uint64_t m_disk_total{0};
+    uint64_t m_disk_free{0};
+    uint64_t m_disk_used{0};
+    uint32_t m_cluster_size{4096};
 
     wchar_t m_target_path[MAX_PATH_EXTENDED];
     std::wstring m_current_folder;

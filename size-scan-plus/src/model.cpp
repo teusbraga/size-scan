@@ -71,6 +71,15 @@ ModelManager::ModelManager()
     : m_is_scanning(false)
     , m_cancel_flag(false)
     , m_hWorkerThread(NULL)
+    , m_live_progress_pct(0.0f)
+    , m_live_files(0)
+    , m_live_folders(0)
+    , m_live_scanned_bytes(0)
+    , m_live_scanned_on_disk(0)
+    , m_disk_total(0)
+    , m_disk_free(0)
+    , m_disk_used(0)
+    , m_cluster_size(4096)
 {
     m_target_path[0] = L'\0';
 }
@@ -118,57 +127,62 @@ void ModelManager::SetCurrentScannedFolder(const wchar_t *folder) {
 }
 
 uint64_t ModelManager::GetDiskTotal() const {
+    if (m_is_scanning.load()) return m_disk_total;
     std::lock_guard<std::mutex> lock(m_data_mutex);
-    return m_current_scan ? m_current_scan->disk_total_bytes : 0;
+    return m_current_scan ? m_current_scan->disk_total_bytes : m_disk_total;
 }
 
 uint64_t ModelManager::GetDiskFree() const {
+    if (m_is_scanning.load()) return m_disk_free;
     std::lock_guard<std::mutex> lock(m_data_mutex);
-    return m_current_scan ? m_current_scan->disk_free_bytes : 0;
+    return m_current_scan ? m_current_scan->disk_free_bytes : m_disk_free;
 }
 
 uint64_t ModelManager::GetDiskUsed() const {
+    if (m_is_scanning.load()) return m_disk_used;
     std::lock_guard<std::mutex> lock(m_data_mutex);
-    return m_current_scan ? m_current_scan->disk_used_bytes : 0;
+    return m_current_scan ? m_current_scan->disk_used_bytes : m_disk_used;
 }
 
 uint64_t ModelManager::GetTotalScannedLogical() const {
+    if (m_is_scanning.load()) return m_live_scanned_bytes.load();
     std::lock_guard<std::mutex> lock(m_data_mutex);
     return m_current_scan ? m_current_scan->total_scanned_bytes : 0;
 }
 
 uint64_t ModelManager::GetTotalScannedOnDisk() const {
+    if (m_is_scanning.load()) return m_live_scanned_on_disk.load();
     std::lock_guard<std::mutex> lock(m_data_mutex);
     return m_current_scan ? m_current_scan->total_scanned_on_disk : 0;
 }
 
 uint64_t ModelManager::GetTotalFiles() const {
+    if (m_is_scanning.load()) return m_live_files.load();
     std::lock_guard<std::mutex> lock(m_data_mutex);
     return m_current_scan ? m_current_scan->total_files : 0;
 }
 
 uint64_t ModelManager::GetTotalFolders() const {
+    if (m_is_scanning.load()) return m_live_folders.load();
     std::lock_guard<std::mutex> lock(m_data_mutex);
     return m_current_scan ? m_current_scan->total_folders : 0;
 }
 
 uint32_t ModelManager::GetClusterSize() const {
+    if (m_is_scanning.load()) return m_cluster_size;
     std::lock_guard<std::mutex> lock(m_data_mutex);
-    return m_current_scan ? m_current_scan->cluster_size : 4096;
+    return m_current_scan ? m_current_scan->cluster_size : m_cluster_size;
 }
 
 float ModelManager::GetScanProgressPct() const {
-    if (!m_is_scanning.load()) {
-        return m_current_scan ? 100.0f : 0.0f;
-    }
-    std::lock_guard<std::mutex> lock(m_data_mutex);
-    if (m_current_scan) {
-        float p = m_current_scan->scan_progress_pct;
+    if (m_is_scanning.load()) {
+        float p = m_live_progress_pct.load();
         if (p < 0.0f) p = 0.0f;
         if (p > 99.0f) p = 99.0f;
         return p;
     }
-    return 0.0f;
+    std::lock_guard<std::mutex> lock(m_data_mutex);
+    return m_current_scan ? 100.0f : 0.0f;
 }
 
 uint64_t ModelManager::GetCategoryTotal(int cat, DisplaySizeMode size_mode) const {
@@ -183,10 +197,19 @@ uint64_t ModelManager::GetCategoryFileCount(int cat) const {
     return m_current_scan->cat_count[cat];
 }
 
-static void ScanProgressCallback(const wchar_t *current_folder, void *user_data) {
+void ModelManager::UpdateScanProgress(const ScanProgressInfo &info) {
+    SetCurrentScannedFolder(info.current_folder);
+    m_live_progress_pct.store(info.progress_pct);
+    m_live_files.store(info.total_files);
+    m_live_folders.store(info.total_folders);
+    m_live_scanned_bytes.store(info.total_scanned_bytes);
+    m_live_scanned_on_disk.store(info.total_scanned_on_disk);
+}
+
+static void ScanProgressCallback(const ScanProgressInfo &info, void *user_data) {
     ModelManager *m = reinterpret_cast<ModelManager*>(user_data);
     if (m) {
-        m->SetCurrentScannedFolder(current_folder);
+        m->UpdateScanProgress(info);
     }
 }
 
@@ -227,6 +250,12 @@ void ModelManager::ExecuteScanThread() {
         m_scan_cache[norm] = snap;
     }
 
+    m_live_progress_pct.store(100.0f);
+    m_live_files.store(temp_res->total_files);
+    m_live_folders.store(temp_res->total_folders);
+    m_live_scanned_bytes.store(temp_res->total_scanned_bytes);
+    m_live_scanned_on_disk.store(temp_res->total_scanned_on_disk);
+
     m_is_scanning.store(false);
     SetCurrentScannedFolder(L"");
 }
@@ -242,6 +271,11 @@ bool ModelManager::SelectOrStartScan(const wchar_t *path, bool force_rescan) {
         if (it != m_scan_cache.end() && it->second->scan_data) {
             wcsncpy_s(m_target_path, MAX_PATH_EXTENDED, norm.c_str(), _TRUNCATE);
             m_current_scan = it->second->scan_data;
+            m_live_progress_pct.store(100.0f);
+            m_live_files.store(m_current_scan->total_files);
+            m_live_folders.store(m_current_scan->total_folders);
+            m_live_scanned_bytes.store(m_current_scan->total_scanned_bytes);
+            m_live_scanned_on_disk.store(m_current_scan->total_scanned_on_disk);
             return false;
         }
     }
@@ -257,9 +291,32 @@ bool ModelManager::SelectOrStartScan(const wchar_t *path, bool force_rescan) {
     }
 
     wcsncpy_s(m_target_path, MAX_PATH_EXTENDED, norm.c_str(), _TRUNCATE);
+
+    // Atualiza estatísticas do disco imediatamente para a UI
+    ULARGE_INTEGER free_bytes_avail, total_bytes, total_free_bytes;
+    if (GetDiskFreeSpaceExW(norm.c_str(), &free_bytes_avail, &total_bytes, &total_free_bytes)) {
+        m_disk_total = total_bytes.QuadPart;
+        m_disk_free = free_bytes_avail.QuadPart;
+        m_disk_used = (total_bytes.QuadPart >= free_bytes_avail.QuadPart) 
+            ? (total_bytes.QuadPart - free_bytes_avail.QuadPart) : 0;
+    }
+    m_cluster_size = FastScanner::DetectClusterSize(norm.c_str());
+
+    // Reseta dados de progresso ao vivo para o novo scan
+    m_live_progress_pct.store(0.0f);
+    m_live_files.store(0);
+    m_live_folders.store(0);
+    m_live_scanned_bytes.store(0);
+    m_live_scanned_on_disk.store(0);
+    SetCurrentScannedFolder(L"");
+
+    {
+        std::lock_guard<std::mutex> lock(m_data_mutex);
+        m_current_scan.reset();
+    }
+
     m_is_scanning.store(true);
     m_cancel_flag.store(false);
-    SetCurrentScannedFolder(L"");
 
     m_hWorkerThread = CreateThread(
         NULL,
@@ -275,6 +332,7 @@ bool ModelManager::SelectOrStartScan(const wchar_t *path, bool force_rescan) {
 
 void ModelManager::CancelScan() {
     m_cancel_flag.store(true);
+    m_live_progress_pct.store(0.0f);
 }
 
 std::vector<FolderViewItem> ModelManager::GetFolders(
